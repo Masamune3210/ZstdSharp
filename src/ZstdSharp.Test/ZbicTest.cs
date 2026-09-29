@@ -124,7 +124,7 @@ namespace ZstdSharp.Test
             fixed (short* dst = counts)
             {
                 nuint result = Methods.ZBIC_readNCount(dst, &maxSymbol, &tableLog, src, (nuint)encoded.Length);
-                Assert.NotEqual(0U, Methods.ZSTD_isError(result));
+                Assert.True(Methods.ZSTD_isError(result));
             }
         }
 
