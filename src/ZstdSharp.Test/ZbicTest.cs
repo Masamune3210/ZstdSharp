@@ -6,6 +6,20 @@ namespace ZstdSharp.Test
 {
     public unsafe class ZbicTest
     {
+        private static byte[] Hex(string value)
+        {
+            if ((value.Length & 1) != 0)
+                throw new ArgumentException("Hex input must have an even length.", nameof(value));
+
+            byte[] result = new byte[value.Length / 2];
+            for (int index = 0; index < result.Length; index++)
+            {
+                result[index] = Convert.ToByte(value.Substring(index * 2, 2), 16);
+            }
+
+            return result;
+        }
+
         private static byte[] RawFrame(params byte[] payload)
         {
             if (payload.Length > 31)
@@ -45,6 +59,26 @@ namespace ZstdSharp.Test
             using var decompressor = new ZbicDecompressor();
             Assert.Equal(new byte[] { (byte)'h', (byte)'e', (byte)'l', (byte)'l', (byte)'o' },
                 decompressor.Unwrap(frame).ToArray());
+        }
+
+        [Fact]
+        public void AtmosphereCompressedEntropyVectorDecompresses()
+        {
+            // Produced from synthetic bytes by Atmosphere's ZBIC-enabled Zstandard compressor.
+            // Unlike RawZbicFrameDecompresses, this contains compressed entropy tables and therefore
+            // exercises the binary-interpolative FSE probability-table path.
+            const string encodedHex = "5a424943600001450b0094120000899aabbccddef0061728394a5b6d7e8fa0b1c2d3e5f60c1d2e3f5062738495a6b7c8daeb01122334455768798a9bacbdcfe0f10718293a4c5d6e7f90a1b2c4d5e6f70d1e2f415263748596a7b9cadbec021324364758697a8b9caebfd0e1f208192b3c4d5e6f8091a3b4c5d6e7f80e2031425364758698a9bacbdced0315263748596a7b8d9eafc0d1e2f30a1b2c3d4e5f708293a4b5c6d7e8fa102132435465778899aabbccddef05162738495a6c7d8e9fb0c1d2e4f50b1c2d3e4f61728394a5b6c7d9ea0011223344566778cedf4b5cc3d44051b8c93546adbe2a3ba2b31f3097a814258c9d091a8192f90f7687ee046b7ce3f46071d8e95566cdde4a5bc2d33f50b7c83445acbd293aa1b21e2f96a713248b9c08198091f80e7586ed036a7b8c9daebfd0e22b200466ae2b6b820f372cf870c3820f372cf870c3820f372cf870c3821d6e58f0e186051f6e58f0e186051f6e58f0e186051f6e986070b809b5725858";
+            byte[] encoded = Hex(encodedHex);
+            byte[] expected = new byte[512];
+            for (int index = 0; index < expected.Length; index++)
+            {
+                expected[index] = (byte)((index * 17 + index / 7) % 251);
+            }
+            Array.Clear(expected, 0, 8);
+
+            Assert.Equal(512UL, ZbicDecompressor.GetDecompressedSize(encoded));
+            using var decompressor = new ZbicDecompressor();
+            Assert.Equal(expected, decompressor.Unwrap(encoded).ToArray());
         }
 
         [Fact]
