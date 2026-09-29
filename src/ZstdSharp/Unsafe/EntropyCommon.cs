@@ -203,12 +203,182 @@ namespace ZstdSharp.Unsafe
             return FSE_readNCount_body(normalizedCounter, maxSVPtr, tableLogPtr, headerBuffer, hbSize);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong ZBIC_refill(ulong value, byte* source, ref nuint bytesLeft)
+        {
+            while (bytesLeft != 0 && (value >> 32) < 0x100)
+            {
+                value = (value << 8) + source[(nint)bytesLeft];
+                bytesLeft--;
+            }
+
+            return value;
+        }
+
+        /// <summary>
+        /// Decodes Nintendo's ZBIC binary-interpolative representation of an FSE normalized-count table.
+        /// The representation is used in place of the normal Zstandard NCount bitstream.
+        /// </summary>
+        public static nuint ZBIC_readNCount(short* normalizedCounter, uint* maxSVPtr, uint* tableLogPtr, void* headerBuffer, nuint hbSize)
+        {
+            if (normalizedCounter == null || maxSVPtr == null || tableLogPtr == null || headerBuffer == null || hbSize < 2)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_srcSize_wrong));
+
+            byte* source = (byte*)headerBuffer;
+            nuint rawBytesLeft = (nuint)(source[0] & 0x7F);
+            uint lowProbability = (uint)(source[0] >> 7);
+            nuint tableBytes = rawBytesLeft + 1;
+
+            /* A probability table is followed by the FSE bitstream it describes. */
+            if (tableBytes >= hbSize)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_srcSize_wrong));
+
+            ulong packed = ZBIC_refill(0, source, ref rawBytesLeft);
+            ulong encodedSymbols = packed / 0x34;
+            uint maxSymbolIndex = (uint)(packed % 0x34) + 1;
+            encodedSymbols = ZBIC_refill(encodedSymbols, source, ref rawBytesLeft);
+
+            if (maxSymbolIndex > *maxSVPtr)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_maxSymbolValue_tooSmall));
+
+            ulong cumulativeTable = encodedSymbols >> 3;
+            uint accuracyLog = (uint)(encodedSymbols & 7) + 5;
+            if (accuracyLog > 15)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_tableLog_tooLarge));
+
+            cumulativeTable = ZBIC_refill(cumulativeTable, source, ref rawBytesLeft);
+            uint probabilitySum = 1U << (int)accuracyLog;
+            ulong interpolationCode = cumulativeTable / probabilitySum;
+            interpolationCode = ZBIC_refill(interpolationCode, source, ref rawBytesLeft);
+
+            ulong remainder = cumulativeTable % probabilitySum;
+            ulong finalCount64 = lowProbability == 0
+                ? remainder + 1
+                : (ulong)maxSymbolIndex + remainder + 2;
+            if (finalCount64 > uint.MaxValue)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+            uint finalCount = (uint)finalCount64;
+
+            uint interpolationSize;
+            if ((maxSymbolIndex & (maxSymbolIndex - 1)) == 0)
+            {
+                interpolationSize = maxSymbolIndex * 2;
+            }
+            else
+            {
+                interpolationSize = 1;
+                while (interpolationSize < maxSymbolIndex)
+                {
+                    interpolationSize <<= 1;
+                }
+            }
+
+            if (interpolationSize == 0 || interpolationSize > 0xFF)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+            uint* cumulative = stackalloc uint[257];
+            memset(cumulative, 0, 257 * sizeof(uint));
+            cumulative[interpolationSize] = finalCount;
+
+            uint* lowerStack = stackalloc uint[256];
+            uint* upperStack = stackalloc uint[256];
+            int stackCount = 0;
+            lowerStack[stackCount] = 0;
+            upperStack[stackCount] = interpolationSize;
+            stackCount++;
+
+            while (stackCount != 0)
+            {
+                stackCount--;
+                uint lower = lowerStack[stackCount];
+                uint upper = upperStack[stackCount];
+                if (upper - lower <= 1)
+                    continue;
+
+                uint middle = lower + (upper - lower) / 2;
+                uint firstCount = cumulative[lower];
+                uint lastCount = cumulative[upper];
+                if (firstCount > lastCount)
+                    return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+                if (firstCount == lastCount)
+                {
+                    for (uint i = lower + 1; i < upper; i++)
+                    {
+                        cumulative[i] = firstCount;
+                    }
+                }
+                else
+                {
+                    ulong radix = (ulong)lastCount - firstCount + 1;
+                    ulong middleValue = interpolationCode % radix + firstCount;
+                    if (middleValue > uint.MaxValue)
+                        return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+                    cumulative[middle] = (uint)middleValue;
+                    interpolationCode /= radix;
+                    interpolationCode = ZBIC_refill(interpolationCode, source, ref rawBytesLeft);
+                }
+
+                if (stackCount + 2 > 256)
+                    return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+                /* Push left first so the right half is processed first, matching Horizon's traversal. */
+                lowerStack[stackCount] = lower;
+                upperStack[stackCount] = middle;
+                stackCount++;
+                lowerStack[stackCount] = middle;
+                upperStack[stackCount] = upper;
+                stackCount++;
+            }
+
+            /* The format includes one final degenerate [0, 1] interval. */
+            if (cumulative[0] != cumulative[1])
+            {
+                uint firstCount = cumulative[0];
+                uint lastCount = cumulative[1];
+                if (firstCount > lastCount)
+                    return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+                ulong radix = (ulong)lastCount - firstCount + 1;
+                cumulative[0] = (uint)(interpolationCode % radix);
+                interpolationCode /= radix;
+                ZBIC_refill(interpolationCode, source, ref rawBytesLeft);
+            }
+
+            uint accumulated = 0;
+            uint remaining = probabilitySum;
+            for (uint symbol = 0; symbol <= maxSymbolIndex; symbol++)
+            {
+                uint count = cumulative[symbol + 1];
+                if (count < accumulated)
+                    return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+                uint distance = count - accumulated;
+                accumulated = count;
+                int probability = (int)distance - (int)lowProbability;
+                uint magnitude = probability < 0 ? (uint)-probability : (uint)probability;
+                if (magnitude > remaining)
+                    return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+                remaining -= magnitude;
+                normalizedCounter[symbol] = (short)probability;
+            }
+
+            if (remaining != 0 || rawBytesLeft != 0)
+                return unchecked((nuint)(-(int)ZSTD_ErrorCode.ZSTD_error_corruption_detected));
+
+            *maxSVPtr = maxSymbolIndex;
+            *tableLogPtr = accuracyLog;
+            return tableBytes;
+        }
+
         /*! FSE_readNCount_bmi2():
          * Same as FSE_readNCount() but pass bmi2=1 when your CPU supports BMI2 and 0 otherwise.
          */
         private static nuint FSE_readNCount_bmi2(short* normalizedCounter, uint* maxSVPtr, uint* tableLogPtr, void* headerBuffer, nuint hbSize, int bmi2)
         {
-            return FSE_readNCount_body_default(normalizedCounter, maxSVPtr, tableLogPtr, headerBuffer, hbSize);
+            return ZBIC_isNCountMode()
+                ? ZBIC_readNCount(normalizedCounter, maxSVPtr, tableLogPtr, headerBuffer, hbSize)
+                : FSE_readNCount_body_default(normalizedCounter, maxSVPtr, tableLogPtr, headerBuffer, hbSize);
         }
 
         /*! FSE_readNCount():
