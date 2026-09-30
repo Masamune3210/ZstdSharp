@@ -1,0 +1,13 @@
+# Keep warning suppression local to inherited low-level port artifacts.
+# These diagnostics do not indicate behavioral problems in the translated Zstd code.
+
+[Unsafe/Bitstream.cs]
+dotnet_diagnostic.CS0219.severity = none
+
+[Unsafe/HufDecompress.cs]
+dotnet_diagnostic.CS0168.severity = none
+
+# This call is an intentional JIT/register-pressure hack carried by the port.
+# Preserve the exact Thread.VolatileRead behavior instead of changing codegen-sensitive logic.
+[Unsafe/ZstdDecompressBlock.cs]
+dotnet_diagnostic.SYSLIB0054.severity = none
